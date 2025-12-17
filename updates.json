@@ -2,8 +2,8 @@
   "updates": {
     "windows": {
       "open-url": "",
-      "latest-version": "1.0",
-      "download-url": "https://raw.githubusercontent.com/alex-spataru/QSimpleUpdater/master/tutorial/download/YesItWorks.jpg",
+      "latest-version": "1.0.1",
+      "download-url": "https://github.com/Tobefearless/YunJinGuiUpdateExcelFile/releases/tag/1.0.1/1.1.exe",
       "changelog": "This is an example changelog for Windows. Go on...",
       "mandatory-update": true
     }
