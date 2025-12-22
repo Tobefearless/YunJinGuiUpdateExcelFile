@@ -1,6 +1,6 @@
 name: Sync Release to Tencent COS
 
-# 触发条件：当你在Github网页点击“Publish release”按钮时触发
+# 触发条件：当你在Github网页点击"Publish release"按钮时触发
 on:
   release:
     types: [published]
@@ -18,33 +18,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2. 设置Python环境并安装coscmd
-      - name: Setup Python and install coscmd
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
+      # 2. 安装GitHub CLI (用于下载release资源)
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update && sudo apt-get install -y gh
           
-      - name: Install coscmd
-        run: pip install coscmd
-
       # 3. 下载当前Release的所有资源文件到 ./assets 目录
       - name: Download Release Assets
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub自动提供的令牌
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 安装GitHub CLI (gh)，如果assets目录不存在则创建
-          if ! command -v gh &> /dev/null; then
-            echo "Installing GitHub CLI..."
-            sudo apt-get update && sudo apt-get install -y gh
-          fi
           mkdir -p ./assets
-          
-          # 下载当前发布版本的所有资源文件
           echo "Downloading assets for tag: ${{ github.event.release.tag_name }}"
+          
+          # 使用GitHub CLI下载release资源
           gh release download "${{ github.event.release.tag_name }}" \
             --dir ./assets \
-            --clobber  # 覆盖已存在的文件
-
+            --clobber
+      
       # 4. 配置COS命令行工具并上传文件到腾讯云COS
       - name: Upload to Tencent COS
         env:
@@ -53,9 +44,25 @@ jobs:
           COS_BUCKET: ${{ secrets.COS_BUCKET }}
           COS_REGION: ${{ secrets.COS_REGION }}
         run: |
-          # 配置coscmd
-          echo "Configuring coscmd with bucket: $COS_BUCKET in region: $COS_REGION"
-          coscmd config -a "$COS_SECRET_ID" -s "$COS_SECRET_KEY" -b "$COS_BUCKET" -r "$COS_REGION"
+          # 检查必要的环境变量是否设置
+          echo "Checking required environment variables..."
+          if [ -z "$COS_SECRET_ID" ] || [ -z "$COS_SECRET_KEY" ]; then
+            echo "❌ COS_SECRET_ID or COS_SECRET_KEY is not set!"
+            exit 1
+          fi
+          
+          if [ -z "$COS_BUCKET" ] || [ -z "$COS_REGION" ]; then
+            echo "❌ COS_BUCKET or COS_REGION is not set!"
+            echo "COS_BUCKET: $COS_BUCKET"
+            echo "COS_REGION: $COS_REGION"
+            exit 1
+          fi
+          
+          echo "✅ All required environment variables are set"
+          
+          # 安装coscmd（使用最新版本）
+          echo "Installing coscmd..."
+          pip install coscmd
           
           # 从tag名称中提取版本号（去除可能的前缀'v'）
           TAG_NAME="${{ github.event.release.tag_name }}"
@@ -66,17 +73,59 @@ jobs:
             VERSION="$TAG_NAME"
           fi
           
-          echo "Uploading files to COS path: release/$VERSION/"
+          echo "TAG_NAME: $TAG_NAME"
+          echo "VERSION: $VERSION"
           
-          # 上传assets目录下所有文件到COS的 release/版本号/ 目录
-          # 递归上传，跳过隐藏文件和可能的JSON文件（根据你的需求调整 --ignore 参数）
-          coscmd upload -r ./assets/ "release/$VERSION/" --ignore "*.json"
+          # 列出要上传的文件
+          echo "Files to upload:"
+          ls -la ./assets/
           
-          # 检查上传是否成功
-          if [ $? -eq 0 ]; then
-            echo "✅ Upload to COS completed successfully!"
-            echo "📁 Files are available at: release/$VERSION/"
+          # 配置coscmd - 使用正确的参数顺序
+          echo "Configuring coscmd with:"
+          echo "  Secret ID: ******"
+          echo "  Secret Key: ******"
+          echo "  Bucket: $COS_BUCKET"
+          echo "  Region: $COS_REGION"
+          
+          # 使用coscmd的配置命令
+          coscmd config -a "$COS_SECRET_ID" -s "$COS_SECRET_KEY" -b "$COS_BUCKET" -r "$COS_REGION"
+          
+          # 检查配置是否成功
+          echo "Checking configuration..."
+          if [ -f ~/.cos.conf ]; then
+            echo "✅ COS configuration file created"
+            # 显示配置（隐藏敏感信息）
+            sed 's/secret_key = .*/secret_key = ***/; s/secret_id = .*/secret_id = ***/' ~/.cos.conf
           else
-            echo "❌ Upload to COS failed!"
-            exit 1  # 失败时退出，标记整个工作流为失败
+            echo "❌ COS configuration file not found!"
+            exit 1
           fi
+          
+          # 创建COS目录结构
+          COS_PATH="release/$VERSION/"
+          echo "Uploading files to COS path: $COS_PATH"
+          
+          # 上传assets目录下所有文件到COS
+          # 如果assets目录为空，则退出
+          if [ -z "$(ls -A ./assets/)" ]; then
+            echo "❌ No files found in ./assets directory!"
+            exit 1
+          fi
+          
+          # 逐个文件上传，以便更好的错误处理
+          for file in ./assets/*; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              echo "Uploading: $filename"
+              coscmd upload "$file" "$COS_PATH$filename"
+              if [ $? -eq 0 ]; then
+                echo "  ✅ Uploaded: $filename"
+              else
+                echo "  ❌ Failed to upload: $filename"
+                exit 1
+              fi
+            fi
+          done
+          
+          echo "✅ All files uploaded successfully!"
+          echo "📁 Files are available at: https://$COS_BUCKET.cos.$COS_REGION.myqcloud.com/$COS_PATH"
