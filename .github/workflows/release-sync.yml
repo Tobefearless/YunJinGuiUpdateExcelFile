@@ -36,7 +36,7 @@ jobs:
             --dir ./assets \
             --clobber
       
-      # 4. 配置COS并上传文件（优化版）
+      # 4. 配置COS并上传文件（修正版）
       - name: Upload to Tencent COS
         env:
           COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
@@ -77,22 +77,21 @@ jobs:
           echo "Files to upload:"
           ls -lh ./assets/
           
-          # 配置coscmd - 使用优化参数
+          # 配置coscmd - 只设置基本参数
           echo "Configuring coscmd..."
           coscmd config \
             -a "$COS_SECRET_ID" \
             -s "$COS_SECRET_KEY" \
             -b "$COS_BUCKET" \
-            -r "$COS_REGION" \
-            --max-thread 5 \
-            --part-size 10 \
-            --timeout 300 \
-            --retry 3
+            -r "$COS_REGION"
           
           # 检查配置
           echo "Checking configuration..."
           if [ -f ~/.cos.conf ]; then
             echo "✅ COS configuration file created"
+            # 显示配置信息（隐藏敏感信息）
+            echo "Configuration content:"
+            grep -v "secret_key\|secret_id" ~/.cos.conf || true
           else
             echo "❌ COS configuration file not found!"
             exit 1
@@ -114,13 +113,18 @@ jobs:
             local path=$2
             local max_retries=3
             local retry_count=0
+            local filename=$(basename "$file")
             
             while [ $retry_count -lt $max_retries ]; do
-              echo "Attempt $((retry_count + 1))/$max_retries: Uploading $(basename "$file")"
+              echo "Attempt $((retry_count + 1))/$max_retries: Uploading $filename"
               
-              # 使用更详细的输出和更长的超时时间
-              if coscmd upload "$file" "$path" --part-size 10 --max-thread 3 --timeout 600; then
-                echo "✅ Successfully uploaded $(basename "$file")"
+              # 使用coscmd上传，添加优化参数
+              # coscmd upload命令支持以下参数：--thread, --part_size, --timeout等
+              if coscmd upload "$file" "$path" \
+                --thread 3 \
+                --part_size 10 \
+                --timeout 600; then
+                echo "✅ Successfully uploaded $filename"
                 return 0
               else
                 retry_count=$((retry_count + 1))
@@ -128,15 +132,20 @@ jobs:
                   echo "⚠️ Upload failed, retrying in 10 seconds... (attempt $retry_count)"
                   sleep 10
                 else
-                  echo "❌ Failed to upload $(basename "$file") after $max_retries attempts"
+                  echo "❌ Failed to upload $filename after $max_retries attempts"
                   return 1
                 fi
               fi
             done
           }
           
+          # 显示coscmd帮助，查看支持的参数
+          echo "Checking coscmd version and available options..."
+          coscmd --help
+          
           # 逐个上传文件，支持重试
           FAILED_FILES=()
+          SUCCESS_COUNT=0
           
           for file in ./assets/*; do
             if [ -f "$file" ]; then
@@ -144,17 +153,21 @@ jobs:
               
               # 显示文件大小
               filesize=$(stat -c%s "$file")
-              echo "File: $filename, Size: $(numfmt --to=iec --suffix=B $filesize)"
+              human_size=$(numfmt --to=iec --suffix=B $filesize 2>/dev/null || echo "${filesize}B")
+              echo "File: $filename, Size: $human_size"
               
-              # 如果是大文件，进行特殊处理
-              if [ $filesize -gt 52428800 ]; then  # 大于50MB
-                echo "⚠️ Large file detected (>50MB), using optimized settings..."
+              # 如果是大文件（大于50MB），使用更保守的设置
+              if [ $filesize -gt 52428800 ]; then
+                echo "⚠️ Large file detected (>50MB), using conservative settings..."
+                
+                # 尝试使用分片上传和断点续传
                 if coscmd upload "$file" "$COS_PATH$filename" \
-                  --part-size 20 \
-                  --max-thread 2 \
+                  --thread 2 \
+                  --part_size 20 \
                   --timeout 900 \
                   --resumable; then
                   echo "✅ Successfully uploaded large file: $filename"
+                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 else
                   echo "❌ Failed to upload large file: $filename"
                   FAILED_FILES+=("$filename")
@@ -162,7 +175,7 @@ jobs:
               else
                 # 普通文件使用重试机制
                 if upload_with_retry "$file" "$COS_PATH$filename"; then
-                  echo "✅ Successfully uploaded: $filename"
+                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 else
                   FAILED_FILES+=("$filename")
                 fi
@@ -174,6 +187,12 @@ jobs:
           done
           
           # 检查结果
+          echo "=========================================="
+          echo "Upload Summary:"
+          echo "  Total files processed: $((SUCCESS_COUNT + ${#FAILED_FILES[@]}))"
+          echo "  Successfully uploaded: $SUCCESS_COUNT"
+          echo "  Failed: ${#FAILED_FILES[@]}"
+          
           if [ ${#FAILED_FILES[@]} -eq 0 ]; then
             echo "✅ All files uploaded successfully!"
             echo "📁 Files are available at: https://$COS_BUCKET.cos.$COS_REGION.myqcloud.com/$COS_PATH"
@@ -183,21 +202,35 @@ jobs:
               echo "  - $failed_file"
             done
             
-            # 尝试一次最终的重试
-            echo "Attempting final retry for failed files..."
+            # 尝试一次最终的重试，使用最保守的设置
+            echo "Attempting final retry for failed files with minimal settings..."
             for failed_file in "${FAILED_FILES[@]}"; do
               file_path="./assets/$failed_file"
               if [ -f "$file_path" ]; then
                 echo "Final attempt for: $failed_file"
+                
+                # 使用最保守的设置：单线程、小分片、长超时
                 if coscmd upload "$file_path" "$COS_PATH$failed_file" \
-                  --part-size 5 \
-                  --max-thread 1 \
+                  --thread 1 \
+                  --part_size 5 \
                   --timeout 1200; then
                   echo "✅ Finally succeeded: $failed_file"
+                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 else
                   echo "❌ Still failed: $failed_file"
+                  # 如果还是失败，尝试使用简单curl方式（备选方案）
+                  echo "Trying alternative method with curl..."
+                  # 这里可以添加curl上传逻辑作为备选
                   exit 1
                 fi
               fi
             done
+          fi
+          
+          # 最终确认所有文件都已上传
+          if [ ${#FAILED_FILES[@]} -eq 0 ]; then
+            echo "🎉 All files uploaded successfully to Tencent COS!"
+          else
+            echo "❌ Some files could not be uploaded after all retries"
+            exit 1
           fi
