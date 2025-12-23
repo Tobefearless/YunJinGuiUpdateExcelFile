@@ -10,20 +10,20 @@ jobs:
     runs-on: ubuntu-latest
     
     permissions:
-      contents: write  # 需要写权限来创建Release
-      packages: read   # 可能需要读取包
+      contents: write
+      packages: read
       
     steps:
-      # 1. 检出代码（虽然可能不需要项目代码本身，但有助于获取工作区）
+      # 1. 检出代码
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2. 安装GitHub CLI (用于下载release资源)
+      # 2. 安装GitHub CLI
       - name: Install GitHub CLI
         run: |
           sudo apt-get update && sudo apt-get install -y gh
           
-      # 3. 下载当前Release的所有资源文件到 ./assets 目录
+      # 3. 下载当前Release的所有资源文件
       - name: Download Release Assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -36,7 +36,7 @@ jobs:
             --dir ./assets \
             --clobber
       
-      # 4. 配置COS命令行工具并上传文件到腾讯云COS
+      # 4. 配置COS并上传文件（优化版）
       - name: Upload to Tencent COS
         env:
           COS_SECRET_ID: ${{ secrets.COS_SECRET_ID }}
@@ -44,7 +44,7 @@ jobs:
           COS_BUCKET: ${{ secrets.COS_BUCKET }}
           COS_REGION: ${{ secrets.COS_REGION }}
         run: |
-          # 检查必要的环境变量是否设置
+          # 检查必要的环境变量
           echo "Checking required environment variables..."
           if [ -z "$COS_SECRET_ID" ] || [ -z "$COS_SECRET_KEY" ]; then
             echo "❌ COS_SECRET_ID or COS_SECRET_KEY is not set!"
@@ -53,20 +53,17 @@ jobs:
           
           if [ -z "$COS_BUCKET" ] || [ -z "$COS_REGION" ]; then
             echo "❌ COS_BUCKET or COS_REGION is not set!"
-            echo "COS_BUCKET: $COS_BUCKET"
-            echo "COS_REGION: $COS_REGION"
             exit 1
           fi
           
           echo "✅ All required environment variables are set"
           
-          # 安装coscmd（使用最新版本）
+          # 安装coscmd
           echo "Installing coscmd..."
           pip install coscmd
           
-          # 从tag名称中提取版本号（去除可能的前缀'v'）
+          # 从tag名称中提取版本号
           TAG_NAME="${{ github.event.release.tag_name }}"
-          # 如果tag以'v'开头，则去掉'v'
           if [[ "$TAG_NAME" == v* ]]; then
             VERSION="${TAG_NAME#v}"
           else
@@ -78,54 +75,129 @@ jobs:
           
           # 列出要上传的文件
           echo "Files to upload:"
-          ls -la ./assets/
+          ls -lh ./assets/
           
-          # 配置coscmd - 使用正确的参数顺序
-          echo "Configuring coscmd with:"
-          echo "  Secret ID: ******"
-          echo "  Secret Key: ******"
-          echo "  Bucket: $COS_BUCKET"
-          echo "  Region: $COS_REGION"
+          # 配置coscmd - 使用优化参数
+          echo "Configuring coscmd..."
+          coscmd config \
+            -a "$COS_SECRET_ID" \
+            -s "$COS_SECRET_KEY" \
+            -b "$COS_BUCKET" \
+            -r "$COS_REGION" \
+            --max-thread 5 \
+            --part-size 10 \
+            --timeout 300 \
+            --retry 3
           
-          # 使用coscmd的配置命令
-          coscmd config -a "$COS_SECRET_ID" -s "$COS_SECRET_KEY" -b "$COS_BUCKET" -r "$COS_REGION"
-          
-          # 检查配置是否成功
+          # 检查配置
           echo "Checking configuration..."
           if [ -f ~/.cos.conf ]; then
             echo "✅ COS configuration file created"
-            # 显示配置（隐藏敏感信息）
-            sed 's/secret_key = .*/secret_key = ***/; s/secret_id = .*/secret_id = ***/' ~/.cos.conf
           else
             echo "❌ COS configuration file not found!"
             exit 1
           fi
           
-          # 创建COS目录结构
+          # 创建COS路径
           COS_PATH="release/$VERSION/"
           echo "Uploading files to COS path: $COS_PATH"
           
-          # 上传assets目录下所有文件到COS
-          # 如果assets目录为空，则退出
+          # 检查assets目录是否为空
           if [ -z "$(ls -A ./assets/)" ]; then
             echo "❌ No files found in ./assets directory!"
             exit 1
           fi
           
-          # 逐个文件上传，以便更好的错误处理
+          # 定义重试函数
+          upload_with_retry() {
+            local file=$1
+            local path=$2
+            local max_retries=3
+            local retry_count=0
+            
+            while [ $retry_count -lt $max_retries ]; do
+              echo "Attempt $((retry_count + 1))/$max_retries: Uploading $(basename "$file")"
+              
+              # 使用更详细的输出和更长的超时时间
+              if coscmd upload "$file" "$path" --part-size 10 --max-thread 3 --timeout 600; then
+                echo "✅ Successfully uploaded $(basename "$file")"
+                return 0
+              else
+                retry_count=$((retry_count + 1))
+                if [ $retry_count -lt $max_retries ]; then
+                  echo "⚠️ Upload failed, retrying in 10 seconds... (attempt $retry_count)"
+                  sleep 10
+                else
+                  echo "❌ Failed to upload $(basename "$file") after $max_retries attempts"
+                  return 1
+                fi
+              fi
+            done
+          }
+          
+          # 逐个上传文件，支持重试
+          FAILED_FILES=()
+          
           for file in ./assets/*; do
             if [ -f "$file" ]; then
               filename=$(basename "$file")
-              echo "Uploading: $filename"
-              coscmd upload "$file" "$COS_PATH$filename"
-              if [ $? -eq 0 ]; then
-                echo "  ✅ Uploaded: $filename"
+              
+              # 显示文件大小
+              filesize=$(stat -c%s "$file")
+              echo "File: $filename, Size: $(numfmt --to=iec --suffix=B $filesize)"
+              
+              # 如果是大文件，进行特殊处理
+              if [ $filesize -gt 52428800 ]; then  # 大于50MB
+                echo "⚠️ Large file detected (>50MB), using optimized settings..."
+                if coscmd upload "$file" "$COS_PATH$filename" \
+                  --part-size 20 \
+                  --max-thread 2 \
+                  --timeout 900 \
+                  --resumable; then
+                  echo "✅ Successfully uploaded large file: $filename"
+                else
+                  echo "❌ Failed to upload large file: $filename"
+                  FAILED_FILES+=("$filename")
+                fi
               else
-                echo "  ❌ Failed to upload: $filename"
-                exit 1
+                # 普通文件使用重试机制
+                if upload_with_retry "$file" "$COS_PATH$filename"; then
+                  echo "✅ Successfully uploaded: $filename"
+                else
+                  FAILED_FILES+=("$filename")
+                fi
               fi
+              
+              # 上传后等待一下，避免过快上传
+              sleep 2
             fi
           done
           
-          echo "✅ All files uploaded successfully!"
-          echo "📁 Files are available at: https://$COS_BUCKET.cos.$COS_REGION.myqcloud.com/$COS_PATH"
+          # 检查结果
+          if [ ${#FAILED_FILES[@]} -eq 0 ]; then
+            echo "✅ All files uploaded successfully!"
+            echo "📁 Files are available at: https://$COS_BUCKET.cos.$COS_REGION.myqcloud.com/$COS_PATH"
+          else
+            echo "❌ Some files failed to upload:"
+            for failed_file in "${FAILED_FILES[@]}"; do
+              echo "  - $failed_file"
+            done
+            
+            # 尝试一次最终的重试
+            echo "Attempting final retry for failed files..."
+            for failed_file in "${FAILED_FILES[@]}"; do
+              file_path="./assets/$failed_file"
+              if [ -f "$file_path" ]; then
+                echo "Final attempt for: $failed_file"
+                if coscmd upload "$file_path" "$COS_PATH$failed_file" \
+                  --part-size 5 \
+                  --max-thread 1 \
+                  --timeout 1200; then
+                  echo "✅ Finally succeeded: $failed_file"
+                else
+                  echo "❌ Still failed: $failed_file"
+                  exit 1
+                fi
+              fi
+            done
+          fi
